@@ -1,0 +1,98 @@
+name: run-cita-checker-playwright
+on:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Set to "true" to force run outside time window'
+        required: false
+        default: 'false'
+  schedule:
+    - cron: '*/30 * * * *'  # optional: adjust or remove
+
+jobs:
+  run-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install minimal system dependencies (for browsers)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libnss3 \
+            libatk1.0-0 \
+            libxss1 \
+            fonts-liberation \
+            ca-certificates \
+            wget || true
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install Python requirements + Playwright
+        run: |
+          set -e
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt || true
+          python -m pip install playwright --upgrade
+          python -m playwright install --with-deps
+
+      - name: Debug network to site (curl)
+        run: |
+          set -e
+          curl -v -I 'https://icp.administracionelectronica.gob.es/icpplus/index.html' > curl_headers.txt || true
+          curl -vL 'https://icp.administracionelectronica.gob.es/icpplus/index.html' -o homepage.html || true
+          head -n 200 homepage.html > homepage_head.txt || true
+          ls -l curl_headers.txt homepage.html homepage_head.txt || true
+
+      - name: Show environment & Playwright sanity check
+        run: |
+          echo "Using Python $(python -V)"
+          python -c "from playwright.sync_api import sync_playwright; print('Playwright import OK')"
+
+      - name: Run cita_checker (Playwright)
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DOC_NUMBER: ${{ secrets.DOC_NUMBER }}
+          FULL_NAME: ${{ secrets.FULL_NAME }}
+          NATIONALITY: ${{ secrets.NATIONALITY }}
+          ERROR_SCREENSHOT_PATH: error.png
+          ERROR_PAGE_SOURCE: page_source.html
+          LAST_PAGE_PNG: last_page.png
+          LAST_PAGE_HTML: last_page.html
+          TRACE_HAR: network.har
+          TRACE_ZIP: trace.zip
+          # Map FORCE_RUN from workflow input
+          FORCE_RUN: ${{ github.event.inputs.force }}
+        run: |
+          set -o pipefail
+          set -e
+          echo "FORCE_RUN=$FORCE_RUN"
+          export PLAYWRIGHT_USER_DATA_DIR=$(mktemp -d -t pw-user-data-XXXX)
+          echo "PLAYWRIGHT_USER_DATA_DIR=$PLAYWRIGHT_USER_DATA_DIR"
+          python -u cita_checker.py || RC=$?
+          RC=${RC:-$?}
+          echo "cita_checker.py exit code: $RC"
+          rm -rf "$PLAYWRIGHT_USER_DATA_DIR" || true
+          exit ${RC}
+
+      - name: Upload debug artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cita-checker-debug
+          path: |
+            last_page.png
+            last_page.html
+            error.png
+            page_source.html
+            network.har
+            trace.zip
+            homepage.html
+            homepage_head.txt
+            curl_headers.txt
+          if-no-files-found: ignore
