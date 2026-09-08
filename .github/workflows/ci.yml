@@ -1,0 +1,55 @@
+name: run-cita-checker
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '*/30 * * * *' # optional: run every 30 minutes, adjust to taste
+
+jobs:
+  run-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            chromium-browser \
+            chromium-chromedriver \
+            libnss3 \
+            libatk1.0-0 \
+            libxss1 \
+            libasound2 \
+            fonts-liberation \
+            libx11-xcb1 \
+            libxcb1
+
+      - name: Show browser + driver versions
+        run: |
+          which chromium-browser || which google-chrome-stable || echo "no chrome found"
+          chromium-browser --version || google-chrome --version || true
+          chromedriver --version || true
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install Python requirements
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run cita_checker
+        env:
+          CHROME_BIN: /usr/bin/chromium-browser
+          # CHROMEDRIVER_PATH not required when using Selenium Manager but left for clarity
+          CHROMEDRIVER_PATH: /usr/bin/chromedriver
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DOC_NUMBER: ${{ secrets.DOC_NUMBER }}
+          FULL_NAME: ${{ secrets.FULL_NAME }}
+          NATIONALITY: ${{ secrets.NATIONALITY }}
+        run: |
+          python -u cita_checker.py
