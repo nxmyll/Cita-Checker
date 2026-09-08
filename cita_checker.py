@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-Playwright-based Cita Checker (non-evasive replacement for Selenium-based checker)
+Playwright-based Cita Checker with tracing and HAR capture
 
 - Uses Playwright sync API and a persistent context (temporary user-data-dir) to avoid
-  DevToolsActivePort/profile issues in CI.
-- Saves artifacts (last_page.png, last_page.html, error.png) on errors for debugging.
+  DevTools/profile issues in CI.
+- Records network HAR and Playwright trace (trace.zip) for debugging.
+- Saves artifacts (last_page.png, last_page.html, error.png, network.har, trace.zip) on errors for debugging.
 - Detects known "no citas" site message and common CAPTCHA markers and sends Telegram alerts.
 - Respects FORCE_RUN env var and Madrid working hours like the original script.
 """
@@ -41,11 +42,13 @@ ACTIVE_WINDOW_END_HOUR = 16
 MAX_RETRIES = 2
 RETRY_DELAY = 5  # seconds
 
-# Artifact filenames
+# Artifact filenames (can be overridden via env)
 ERROR_SCREENSHOT = os.environ.get("ERROR_SCREENSHOT_PATH", "error.png")
 ERROR_PAGE_SOURCE = os.environ.get("ERROR_PAGE_SOURCE", "page_source.html")
 LAST_PAGE_PNG = os.environ.get("LAST_PAGE_PNG", "last_page.png")
 LAST_PAGE_HTML = os.environ.get("LAST_PAGE_HTML", "last_page.html")
+HAR_PATH = os.environ.get("TRACE_HAR", "network.har")
+TRACE_PATH = os.environ.get("TRACE_ZIP", "trace.zip")
 # =====================================
 
 
@@ -79,12 +82,15 @@ def run_single_check() -> bool:
     """Run a single Playwright-based check. Returns True if availability or captcha detected (alerts sent), False if no slots or an error."""
     user_data_dir = os.environ.get("PLAYWRIGHT_USER_DATA_DIR") or tempfile.mkdtemp(prefix="pw-user-data-")
     created_temp_dir = os.environ.get("PLAYWRIGHT_USER_DATA_DIR") is None
+    context = None
+    tracing_started = False
 
     try:
         with sync_playwright() as p:
             browser_type = p.chromium
 
             # Launch a persistent context so the browser uses a writable profile directory
+            # and record HAR to HAR_PATH for later inspection.
             context = browser_type.launch_persistent_context(
                 user_data_dir,
                 headless=True,
@@ -101,27 +107,78 @@ def run_single_check() -> bool:
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                     "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
                 ),
+                record_har_path=HAR_PATH,
             )
+
+            # Start Playwright tracing (screenshots, snapshots, sources)
+            try:
+                context.tracing.start(screenshots=True, snapshots=True, sources=True)
+                tracing_started = True
+            except Exception as e:
+                print("⚠️ Could not start tracing:", e, flush=True)
 
             page = context.pages[0] if context.pages else context.new_page()
             page.set_default_timeout(30000)  # 30s
 
+            # Robust navigation: try networkidle first, then fallback to domcontentloaded
             print("Loading homepage...", flush=True)
+            nav_resp = None
             try:
-                page.goto(BASE_URL, wait_until="networkidle")
-            except (PlayTimeoutError, PlayError) as e:
-                print("Homepage navigation timed out or errored:", e, flush=True)
+                try:
+                    nav_resp = page.goto(BASE_URL, wait_until="networkidle", timeout=30000)
+                    print("goto(networkidle) response status:", getattr(nav_resp, "status", None), "url:", page.url, flush=True)
+                except Exception as e_net:
+                    print("networkidle navigation failed:", e_net, flush=True)
+                    nav_resp = page.goto(BASE_URL, wait_until="domcontentloaded", timeout=60000)
+                    print("goto(domcontentloaded) response status:", getattr(nav_resp, "status", None), "url:", page.url, flush=True)
+            except Exception as nav_exc:
+                print("Navigation attempts failed:", nav_exc, flush=True)
+                # Try a lightweight HTTP fetch to capture raw HTML
+                try:
+                    import requests as _req
+                    r = _req.get(BASE_URL, timeout=20)
+                    print("requests GET status:", r.status_code, "len:", len(r.text), flush=True)
+                    with open("homepage_fallback.html", "w", encoding="utf-8") as fh:
+                        fh.write(r.text)
+                    print("Wrote homepage_fallback.html", flush=True)
+                except Exception as re:
+                    print("requests GET also failed:", re, flush=True)
 
-            # allow JS to run
-            time.sleep(1.5)
+                # capture artifacts and fail
+                try:
+                    page.screenshot(path=ERROR_SCREENSHOT, full_page=True)
+                except Exception:
+                    pass
+                try:
+                    with open(ERROR_PAGE_SOURCE, "w", encoding="utf-8") as f:
+                        f.write(page.content() if page else "")
+                except Exception:
+                    pass
+                # Ensure tracing is stopped and context closed in finally
+                return False
+
+            # Wait explicitly for the select element
+            try:
+                page.wait_for_selector("#sede", timeout=45000)
+                print("Found #sede, proceeding", flush=True)
+            except Exception as e_sel:
+                print("Timed out waiting for #sede:", e_sel, flush=True)
+                try:
+                    page.screenshot(path=ERROR_SCREENSHOT, full_page=True)
+                except Exception:
+                    pass
+                try:
+                    with open(ERROR_PAGE_SOURCE, "w", encoding="utf-8") as f:
+                        f.write(page.content())
+                except Exception:
+                    pass
+                return False
 
             # Step 1: select office and procedure
             print("Selecting office and procedure...", flush=True)
             try:
-                # Use CSS selectors; select_option expects the select's value attribute
                 page.select_option("#sede", OFICINA_VALUE)
                 human_delay()
-                # escape square brackets in selector for tramiteGrupo[0]
                 page.select_option("#tramiteGrupo\\[0\\]", TRAMITE_VALUE)
                 human_delay()
                 page.click("#btnAceptar")
@@ -131,10 +188,8 @@ def run_single_check() -> bool:
                     page.screenshot(path=ERROR_SCREENSHOT, full_page=True)
                     with open(ERROR_PAGE_SOURCE, "w", encoding="utf-8") as f:
                         f.write(page.content())
-                    print("Saved debug artifacts after Step 1 failure.", flush=True)
                 except Exception:
                     pass
-                context.close()
                 return False
 
             # Step 2: continue without Cl@ve
@@ -163,10 +218,8 @@ def run_single_check() -> bool:
                     page.screenshot(path=ERROR_SCREENSHOT, full_page=True)
                     with open(ERROR_PAGE_SOURCE, "w", encoding="utf-8") as f:
                         f.write(page.content())
-                    print("Saved debug artifacts after Step 3 failure.", flush=True)
                 except Exception:
                     pass
-                context.close()
                 return False
 
             # Wait for result page to settle
@@ -185,7 +238,6 @@ def run_single_check() -> bool:
             # Check for known "no citas" text
             if NO_CITAS_PHRASE in content:
                 print("No slots — known site message found.", flush=True)
-                context.close()
                 return False
 
             # Detect captcha heuristically
@@ -204,19 +256,16 @@ def run_single_check() -> bool:
                 send_telegram_alert(
                     "⚠️ Posible cita disponible pero hay un CAPTCHA que requiere verificación manual. Revisa: " + BASE_URL
                 )
-                context.close()
                 return True
 
             # If neither no-citas nor captcha, assume possible availability
             print("Unexpected page state — possible availability. Sending alert.", flush=True)
             send_telegram_alert("🚨 Posible disponibilidad detectada — revisa manualmente: " + BASE_URL)
-            context.close()
             return True
 
     except Exception as e:
         print("❌ Playwright error:", e, flush=True)
         try:
-            # Attempt to save a short message as page source for debugging
             with open(ERROR_PAGE_SOURCE, "w", encoding="utf-8") as f:
                 f.write(str(e))
         except Exception:
@@ -224,6 +273,21 @@ def run_single_check() -> bool:
         return False
 
     finally:
+        # Stop tracing and close context if present
+        try:
+            if context and tracing_started:
+                try:
+                    context.tracing.stop(path=TRACE_PATH)
+                    print(f"Saved Playwright trace to {TRACE_PATH}", flush=True)
+                except Exception as e:
+                    print("⚠️ Could not stop tracing:", e, flush=True)
+        except Exception:
+            pass
+        try:
+            if context:
+                context.close()
+        except Exception:
+            pass
         # cleanup temporary user-data-dir if we created it
         if created_temp_dir:
             try:
