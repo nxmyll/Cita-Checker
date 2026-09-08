@@ -20,7 +20,7 @@ jobs:
             libnss3 \
             libatk1.0-0 \
             libxss1 \
-            libasound2 \
+            
             fonts-liberation \
             libx11-xcb1 \
             libxcb1
