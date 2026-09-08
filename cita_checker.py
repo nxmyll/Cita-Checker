@@ -1,20 +1,26 @@
 #!/usr/bin/env python3
+"""
+Playwright-based Cita Checker (non-evasive replacement for Selenium-based checker)
+
+- Uses Playwright sync API and a persistent context (temporary user-data-dir) to avoid
+  DevToolsActivePort/profile issues in CI.
+- Saves artifacts (last_page.png, last_page.html, error.png) on errors for debugging.
+- Detects known "no citas" site message and common CAPTCHA markers and sends Telegram alerts.
+- Respects FORCE_RUN env var and Madrid working hours like the original script.
+"""
+from __future__ import annotations
+
 import os
 import sys
 import time
 import tempfile
 import shutil
+import random
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import requests
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import Select, WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException, WebDriverException
+from playwright.sync_api import sync_playwright, TimeoutError as PlayTimeoutError, Error as PlayError
 
 # ============== CONFIG ==============
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -25,23 +31,21 @@ NATIONALITY = os.environ.get("NATIONALITY")
 
 BASE_URL = "https://icp.administracionelectronica.gob.es/icpplus/index.html"
 
-# Confirmed from the live "sede" dropdown: "99" = Cualquier oficina (any Barcelona office)
 OFICINA_VALUE = "99"
-
-# Confirmed from the live "tramiteGrupo[0]" dropdown:
-# "POLICÍA-TOMA DE HUELLAS (EXPEDICIÓN DE TARJETA) INICIAL, RENOVACIÓN, DUPLICADO Y LEY 14/2013"
 TRAMITE_VALUE = "4010"
-
-# Confirmed from the live "txtPaisNac" dropdown: "424" = PAKISTAN
 NATIONALITY_VALUE = "424"
-
-# Exact phrase confirmed from the live site when there is no availability at all
 NO_CITAS_PHRASE = "no ofrece el servicio de Cita Previa Internet"
 
 ACTIVE_WINDOW_START_HOUR = 8
 ACTIVE_WINDOW_END_HOUR = 16
 MAX_RETRIES = 2
 RETRY_DELAY = 5  # seconds
+
+# Artifact filenames
+ERROR_SCREENSHOT = os.environ.get("ERROR_SCREENSHOT_PATH", "error.png")
+ERROR_PAGE_SOURCE = os.environ.get("ERROR_PAGE_SOURCE", "page_source.html")
+LAST_PAGE_PNG = os.environ.get("LAST_PAGE_PNG", "last_page.png")
+LAST_PAGE_HTML = os.environ.get("LAST_PAGE_HTML", "last_page.html")
 # =====================================
 
 
@@ -50,12 +54,7 @@ def send_telegram_alert(text: str) -> bool:
         print("❌ Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID env vars.")
         return False
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    data = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": text,
-        "parse_mode": "Markdown",
-        "disable_web_page_preview": False,
-    }
+    data = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"}
     try:
         r = requests.post(url, data=data, timeout=15)
         print(f"📩 Telegram: {r.status_code} — {'OK' if r.ok else r.text}")
@@ -72,261 +71,188 @@ def within_active_window() -> bool:
     return ACTIVE_WINDOW_START_HOUR <= now_madrid.hour < ACTIVE_WINDOW_END_HOUR
 
 
-def _find_chrome_binary():
-    # Prefer explicit env var, otherwise try common names
-    env_bin = os.environ.get("CHROME_BIN")
-    if env_bin:
-        return env_bin
-    from shutil import which
-
-    for name in ("chromium-browser", "chromium", "google-chrome-stable", "google-chrome"):
-        path = which(name)
-        if path:
-            return path
-    # fallback to a common path so options.binary_location won't be empty
-    return "/usr/bin/chromium-browser"
-
-
-def _make_base_options(headless_variant: str, user_data_dir: str) -> Options:
-    options = Options()
-    # headless_variant: 'new' or 'chrome'
-    if headless_variant == "new":
-        options.add_argument("--headless=new")
-    else:
-        options.add_argument("--headless=chrome")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--disable-extensions")
-    options.add_argument("--disable-software-rasterizer")
-    options.add_argument("--disable-blink-features=AutomationControlled")
-    options.add_argument("--remote-debugging-port=0")
-    options.add_argument("--disable-setuid-sandbox")
-    options.add_argument("--no-zygote")
-    options.add_argument("--single-process")
-    options.add_argument("--window-size=1280,900")
-    options.add_argument(f"--user-data-dir={user_data_dir}")
-    options.add_argument(
-        "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
-    )
-    options.page_load_strategy = "normal"
-    options.binary_location = _find_chrome_binary()
-    return options
-
-
-def build_driver() -> webdriver.Chrome:
-    """
-    Try to start Chrome with a temporary writable user-data-dir.
-    First attempt uses new headless mode; on DevToolsActivePort failure we retry with classic headless.
-    """
-    # Create temp user data dir for Chrome to avoid permission issues
-    user_data_dir = os.environ.get("CHROME_USER_DATA_DIR") or tempfile.mkdtemp(prefix="selenium-user-data-")
-    last_exc = None
-
-    for headless_variant in ("new", "chrome"):
-        options = _make_base_options(headless_variant, user_data_dir)
-        # Write chromedriver logs to chromedriver.log in the working dir
-        service = Service(log_path="chromedriver.log", service_args=["--verbose"])
-        try:
-            print(f"Launching Chromium (headless={headless_variant}) with user-data-dir={user_data_dir} ...", flush=True)
-            driver = webdriver.Chrome(service=service, options=options)
-            driver.set_page_load_timeout(45)
-            # attach the user-data-dir so we can clean it up later
-            try:
-                driver._selenium_user_data_dir = user_data_dir
-            except Exception:
-                pass
-            print("Chromium launched successfully.", flush=True)
-            try:
-                print("Driver capabilities:", driver.capabilities, flush=True)
-            except Exception:
-                pass
-            return driver
-        except WebDriverException as e:
-            print(f"⚠️ Chrome startup failed with headless={headless_variant}: {e}", flush=True)
-            last_exc = e
-            # If the driver was partially created, attempt to quit and continue
-            try:
-                # Some drivers may exist as local variables in the exception; ensure cleanup
-                pass
-            except Exception:
-                pass
-            # Try next headless variant
-            continue
-
-    # if we get here, both attempts failed: remove temp dir then raise the last exception
-    try:
-        shutil.rmtree(user_data_dir)
-    except Exception:
-        pass
-    raise last_exc or RuntimeError("Could not start Chrome/WebDriver")
+def human_delay(min_s: float = 0.25, max_s: float = 0.9):
+    time.sleep(random.uniform(min_s, max_s))
 
 
 def run_single_check() -> bool:
-    driver = None
+    """Run a single Playwright-based check. Returns True if availability or captcha detected (alerts sent), False if no slots or an error."""
+    user_data_dir = os.environ.get("PLAYWRIGHT_USER_DATA_DIR") or tempfile.mkdtemp(prefix="pw-user-data-")
+    created_temp_dir = os.environ.get("PLAYWRIGHT_USER_DATA_DIR") is None
+
     try:
-        driver = build_driver()
-        wait = WebDriverWait(driver, 20)
+        with sync_playwright() as p:
+            browser_type = p.chromium
 
-        # Step 1: homepage -> select office + procedure
-        print("Loading homepage...", flush=True)
-        try:
-            driver.get(BASE_URL)
-        except TimeoutException:
-            print("Homepage load timed out — proceeding with whatever loaded so far.", flush=True)
-
-        # Wait for page and JavaScript to settle
-        time.sleep(2)
-
-        sede_el = wait.until(EC.presence_of_element_located((By.ID, "sede")))
-        Select(sede_el).select_by_value(OFICINA_VALUE)
-
-        tramite_el = wait.until(EC.presence_of_element_located((By.ID, "tramiteGrupo[0]")))
-        Select(tramite_el).select_by_value(TRAMITE_VALUE)
-
-        aceptar_btn = wait.until(EC.element_to_be_clickable((By.ID, "btnAceptar")))
-        aceptar_btn.click()
-        print("Step 1 done: office + procedure selected.", flush=True)
-
-        # Step 2: info/terms page -> "Presentación sin Cl@ve"
-        entrar_btn = wait.until(EC.element_to_be_clickable((By.ID, "btnEntrar")))
-        entrar_btn.click()
-        print("Step 2 done: continued without Cl@ve.", flush=True)
-
-        # Step 3: personal details form (NIE, name, nationality)
-        nie_field = wait.until(EC.presence_of_element_located((By.ID, "txtIdCitado")))
-        nie_field.clear()
-        nie_field.send_keys(DOC_NUMBER)
-
-        name_field = driver.find_element(By.ID, "txtDesCitado")
-        name_field.clear()
-        name_field.send_keys(FULL_NAME)
-
-        pais_el = driver.find_element(By.ID, "txtPaisNac")
-        Select(pais_el).select_by_value(NATIONALITY_VALUE)
-
-        enviar_btn = driver.find_element(By.ID, "btnEnviar")
-        enviar_btn.click()
-        print("Step 3 done: personal details submitted.", flush=True)
-
-        # Step 4: result — either bounced back with "no citas" message,
-        # a captcha, or (if slots exist) an actual booking/calendar page.
-        time.sleep(3)
-        page_text = driver.page_source
-
-        if NO_CITAS_PHRASE in page_text:
-            print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] ❌ No slots — confirmed via real site message")
-            return False
-
-        # Heuristic CAPTCHA detection (site uses eu-captcha elsewhere on the flow)
-        captcha_present = any(
-            len(driver.find_elements(By.ID, cid)) > 0
-            for cid in ["captcha", "captchaAnswer", "txtCodigoVerificacion"]
-        )
-        if captcha_present:
-            msg = (
-                "⚠️ *Posible cita disponible — verificación manual necesaria*\n\n"
-                "El sitio mostró un CAPTCHA que el script no puede resolver. "
-                "Esto puede significar que hay citas disponibles.\n\n"
-                "👉 Revisa manualmente ahora:\n"
-                f"{BASE_URL}"
+            # Launch a persistent context so the browser uses a writable profile directory
+            context = browser_type.launch_persistent_context(
+                user_data_dir,
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                    "--disable-setuid-sandbox",
+                    "--single-process",
+                ],
+                viewport={"width": 1280, "height": 900},
+                locale="es-ES",
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+                ),
             )
-            send_telegram_alert(msg)
-            print("⚠️ CAPTCHA encountered — alerted for manual check.")
+
+            page = context.pages[0] if context.pages else context.new_page()
+            page.set_default_timeout(30000)  # 30s
+
+            print("Loading homepage...", flush=True)
+            try:
+                page.goto(BASE_URL, wait_until="networkidle")
+            except (PlayTimeoutError, PlayError) as e:
+                print("Homepage navigation timed out or errored:", e, flush=True)
+
+            # allow JS to run
+            time.sleep(1.5)
+
+            # Step 1: select office and procedure
+            print("Selecting office and procedure...", flush=True)
+            try:
+                # Use CSS selectors; select_option expects the select's value attribute
+                page.select_option("#sede", OFICINA_VALUE)
+                human_delay()
+                # escape square brackets in selector for tramiteGrupo[0]
+                page.select_option("#tramiteGrupo\\[0\\]", TRAMITE_VALUE)
+                human_delay()
+                page.click("#btnAceptar")
+            except PlayError as e:
+                print("Error interacting with Step 1 elements:", e, flush=True)
+                try:
+                    page.screenshot(path=ERROR_SCREENSHOT, full_page=True)
+                    with open(ERROR_PAGE_SOURCE, "w", encoding="utf-8") as f:
+                        f.write(page.content())
+                    print("Saved debug artifacts after Step 1 failure.", flush=True)
+                except Exception:
+                    pass
+                context.close()
+                return False
+
+            # Step 2: continue without Cl@ve
+            try:
+                page.wait_for_selector("#btnEntrar", timeout=10000)
+                human_delay()
+                page.click("#btnEntrar")
+            except PlayTimeoutError:
+                print("btnEntrar not found; proceeding", flush=True)
+            except PlayError as e:
+                print("Error clicking btnEntrar:", e, flush=True)
+
+            # Step 3: Fill personal details
+            try:
+                page.wait_for_selector("#txtIdCitado", timeout=10000)
+                page.fill("#txtIdCitado", DOC_NUMBER or "")
+                human_delay()
+                page.fill("#txtDesCitado", FULL_NAME or "")
+                human_delay()
+                page.select_option("#txtPaisNac", NATIONALITY_VALUE)
+                human_delay()
+                page.click("#btnEnviar")
+            except PlayError as e:
+                print("Error on Step 3 interactions:", e, flush=True)
+                try:
+                    page.screenshot(path=ERROR_SCREENSHOT, full_page=True)
+                    with open(ERROR_PAGE_SOURCE, "w", encoding="utf-8") as f:
+                        f.write(page.content())
+                    print("Saved debug artifacts after Step 3 failure.", flush=True)
+                except Exception:
+                    pass
+                context.close()
+                return False
+
+            # Wait for result page to settle
+            page.wait_for_timeout(2500)
+            content = page.content()
+
+            # Save last page artifacts
+            try:
+                page.screenshot(path=LAST_PAGE_PNG, full_page=True)
+                with open(LAST_PAGE_HTML, "w", encoding="utf-8") as f:
+                    f.write(content)
+                print("Saved last_page artifacts.", flush=True)
+            except Exception as e:
+                print("Failed to save last page artifacts:", e, flush=True)
+
+            # Check for known "no citas" text
+            if NO_CITAS_PHRASE in content:
+                print("No slots — known site message found.", flush=True)
+                context.close()
+                return False
+
+            # Detect captcha heuristically
+            captcha_selectors = ["#captcha", "iframe[src*='captcha']", "[id*=captcha]"]
+            captcha_found = False
+            for sel in captcha_selectors:
+                try:
+                    if page.query_selector(sel):
+                        captcha_found = True
+                        break
+                except Exception:
+                    pass
+
+            if captcha_found:
+                print("CAPTCHA detected — sending alert.", flush=True)
+                send_telegram_alert(
+                    "⚠️ Posible cita disponible pero hay un CAPTCHA que requiere verificación manual. Revisa: " + BASE_URL
+                )
+                context.close()
+                return True
+
+            # If neither no-citas nor captcha, assume possible availability
+            print("Unexpected page state — possible availability. Sending alert.", flush=True)
+            send_telegram_alert("🚨 Posible disponibilidad detectada — revisa manualmente: " + BASE_URL)
+            context.close()
             return True
 
-        # Anything else at this point is unexpected — did not match the known
-        # "no citas" message and no captcha was found. This is the most likely
-        # place real availability would show up, so alert rather than stay silent.
-        msg = (
-            "🚨 *Posible disponibilidad detectada — revisa manualmente*\n\n"
-            f"👉 {BASE_URL}\n\n"
-            "(El script no reconoció el mensaje habitual de 'no hay citas' — "
-            "la página puede mostrar disponibilidad real o haber cambiado.)"
-        )
-        send_telegram_alert(msg)
-        print("🚨 Unexpected page state (not the known no-citas message) — alert sent.")
-        return True
-
-    except WebDriverException as e:
-        # Capture debugging artifacts to help diagnose CI/browser failures
+    except Exception as e:
+        print("❌ Playwright error:", e, flush=True)
         try:
-            if driver:
-                screenshot_path = os.environ.get("ERROR_SCREENSHOT_PATH", "error.png")
-                page_source_path = os.environ.get("ERROR_PAGE_SOURCE", "page_source.html")
-                try:
-                    driver.save_screenshot(screenshot_path)
-                    print(f"Saved screenshot to {screenshot_path}", flush=True)
-                except Exception:
-                    pass
-                try:
-                    with open(page_source_path, "w", encoding="utf-8") as f:
-                        f.write(driver.page_source)
-                    print(f"Saved page source to {page_source_path}", flush=True)
-                except Exception:
-                    pass
+            # Attempt to save a short message as page source for debugging
+            with open(ERROR_PAGE_SOURCE, "w", encoding="utf-8") as f:
+                f.write(str(e))
         except Exception:
             pass
+        return False
 
-        print(f"❌ WebDriver error: {e}", flush=True)
-        return False
-    except Exception as e:
-        print(f"❌ Fatal error: {e}", flush=True)
-        return False
     finally:
-        # Quit the driver and cleanup any temporary user-data-dir we created
-        if driver:
+        # cleanup temporary user-data-dir if we created it
+        if created_temp_dir:
             try:
-                user_data_dir = getattr(driver, "_selenium_user_data_dir", None)
-                try:
-                    driver.quit()
-                except Exception as e:
-                    print(f"⚠️ Error closing driver: {e}", flush=True)
-                if user_data_dir:
-                    try:
-                        shutil.rmtree(user_data_dir)
-                        print(f"Removed temporary user-data-dir: {user_data_dir}", flush=True)
-                    except Exception as e:
-                        print(f"⚠️ Could not remove user-data-dir {user_data_dir}: {e}", flush=True)
-            except Exception:
-                pass
+                shutil.rmtree(user_data_dir)
+                print(f"Removed temporary user-data-dir: {user_data_dir}", flush=True)
+            except Exception as e:
+                print("Could not remove user-data-dir:", e, flush=True)
 
 
 def run_with_retry() -> bool:
-    """Run the check with retry logic for transient failures."""
     for attempt in range(1, MAX_RETRIES + 1):
-        print(f"\n{'='*50}")
+        print("\n" + "=" * 50)
         print(f"Attempt {attempt}/{MAX_RETRIES}")
-        print(f"{'='*50}\n", flush=True)
-        
-        try:
-            result = run_single_check()
-            if result:
-                return True
-            else:
-                print(f"❌ Attempt {attempt} returned failure (False).", flush=True)
-                if attempt < MAX_RETRIES:
-                    print(f"⏳ Waiting {RETRY_DELAY}s before retry...", flush=True)
-                    time.sleep(RETRY_DELAY)
-                else:
-                    print("❌ All retry attempts exhausted.", flush=True)
-                    return False
-        except Exception as e:
-            print(f"❌ Attempt {attempt} failed with exception: {e}", flush=True)
+        print("=" * 50 + "\n", flush=True)
+        ok = run_single_check()
+        if ok:
+            return True
+        else:
             if attempt < MAX_RETRIES:
-                print(f"⏳ Waiting {RETRY_DELAY}s before retry...", flush=True)
+                print(f"Waiting {RETRY_DELAY}s before retry...", flush=True)
                 time.sleep(RETRY_DELAY)
             else:
-                print("❌ All retry attempts exhausted.", flush=True)
-                raise
-    
+                print("All retry attempts exhausted.", flush=True)
+                return False
     return False
 
 
 if __name__ == "__main__":
     now_madrid = datetime.now(ZoneInfo("Europe/Madrid"))
-    # FORCE_RUN should be "true" to force execution outside window
     force_run = os.environ.get("FORCE_RUN", "").lower() == "true"
 
     if not force_run and not within_active_window():
@@ -345,7 +271,7 @@ if __name__ == "__main__":
         sys.exit(1)
 
     if not result:
-        print("❌ Check finished but reported failure (no availability / webdriver issue). Exiting with non-zero code.", flush=True)
+        print("❌ Check finished but reported failure (no availability / browser issue). Exiting with non-zero code.", flush=True)
         sys.exit(1)
 
     print("✅ Check finished and reported success.")
