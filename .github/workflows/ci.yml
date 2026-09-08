@@ -52,6 +52,7 @@ jobs:
           NATIONALITY: ${{ secrets.NATIONALITY }}
           ERROR_SCREENSHOT_PATH: error.png
           ERROR_PAGE_SOURCE: page_source.html
+          FORCE_RUN: "true"
         run: |
           set -o pipefail
           # Detect available Chrome/Chromium binary and export CHROME_BIN for the script
