@@ -13,17 +13,16 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Install Chromium
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y chromium-browser chromium-chromedriver
+      - uses: browser-actions/setup-chrome@v1
+        id: setup-chrome
+      - uses: nanasess/setup-chromedriver@v2
       - run: pip install -r requirements.txt
-      - run: python cita_checker.py
+      - run: python -u cita_checker.py
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           DOC_NUMBER: ${{ secrets.DOC_NUMBER }}
           FULL_NAME: ${{ secrets.FULL_NAME }}
           NATIONALITY: ${{ secrets.NATIONALITY }}
-          CHROME_BIN: /usr/bin/chromium-browser
-          CHROMEDRIVER_PATH: /usr/bin/chromedriver
+          CHROME_BIN: ${{ steps.setup-chrome.outputs.chrome-path }}
+          CHROMEDRIVER_PATH: chromedriver
