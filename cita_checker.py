@@ -36,7 +36,7 @@ NATIONALITY_VALUE = "424"
 NO_CITAS_PHRASE = "no ofrece el servicio de Cita Previa Internet"
 
 ACTIVE_WINDOW_START_HOUR = 8
-ACTIVE_WINDOW_END_HOUR = 18
+ACTIVE_WINDOW_END_HOUR = 23
 # =====================================
 
 
