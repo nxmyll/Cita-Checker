@@ -1,12 +1,16 @@
+#!/usr/bin/env python3
 import os
 import sys
 import time
+import tempfile
+import shutil
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import requests
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import Select, WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
@@ -32,8 +36,6 @@ TRAMITE_VALUE = "4010"
 NATIONALITY_VALUE = "424"
 
 # Exact phrase confirmed from the live site when there is no availability at all
-# for the selected province/procedure (it bounces back to the province page with
-# this message and empty dropdowns).
 NO_CITAS_PHRASE = "no ofrece el servicio de Cita Previa Internet"
 
 ACTIVE_WINDOW_START_HOUR = 8
@@ -70,42 +72,95 @@ def within_active_window() -> bool:
     return ACTIVE_WINDOW_START_HOUR <= now_madrid.hour < ACTIVE_WINDOW_END_HOUR
 
 
-def build_driver():
+def _find_chrome_binary():
+    # Prefer explicit env var, otherwise try common names
+    env_bin = os.environ.get("CHROME_BIN")
+    if env_bin:
+        return env_bin
+    from shutil import which
+
+    for name in ("chromium-browser", "chromium", "google-chrome-stable", "google-chrome"):
+        path = which(name)
+        if path:
+            return path
+    # fallback to a common path so options.binary_location won't be empty
+    return "/usr/bin/chromium-browser"
+
+
+def _make_base_options(headless_variant: str, user_data_dir: str) -> Options:
     options = Options()
-    options.add_argument("--headless=new")
+    # headless_variant: 'new' or 'chrome'
+    if headless_variant == "new":
+        options.add_argument("--headless=new")
+    else:
+        options.add_argument("--headless=chrome")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
     options.add_argument("--disable-extensions")
     options.add_argument("--disable-software-rasterizer")
     options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_argument("--remote-debugging-port=0")
+    options.add_argument("--disable-setuid-sandbox")
+    options.add_argument("--no-zygote")
+    options.add_argument("--single-process")
     options.add_argument("--window-size=1280,900")
+    options.add_argument(f"--user-data-dir={user_data_dir}")
     options.add_argument(
         "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
     )
-    # Use "normal" page load strategy for stability — waits for network idle.
     options.page_load_strategy = "normal"
-    options.binary_location = os.environ.get("CHROME_BIN", "/usr/bin/chromium-browser")
+    options.binary_location = _find_chrome_binary()
+    return options
 
-    print("Launching Chromium...", flush=True)
 
-    try:
-        # Let Selenium Manager handle the driver binary when possible (selenium>=4.8)
-        # If CHROMEDRIVER_PATH is provided we still let Selenium pick it up via PATH,
-        # otherwise Selenium Manager will download a compatible driver automatically.
-        driver = webdriver.Chrome(options=options)
-        driver.set_page_load_timeout(45)
-        print("Chromium launched successfully.", flush=True)
-        # Print capabilities for debugging (shows browser version and binary used)
+def build_driver() -> webdriver.Chrome:
+    """
+    Try to start Chrome with a temporary writable user-data-dir.
+    First attempt uses new headless mode; on DevToolsActivePort failure we retry with classic headless.
+    """
+    # Create temp user data dir for Chrome to avoid permission issues
+    user_data_dir = os.environ.get("CHROME_USER_DATA_DIR") or tempfile.mkdtemp(prefix="selenium-user-data-")
+    last_exc = None
+
+    for headless_variant in ("new", "chrome"):
+        options = _make_base_options(headless_variant, user_data_dir)
+        # Write chromedriver logs to chromedriver.log in the working dir
+        service = Service(log_path="chromedriver.log", service_args=["--verbose"])
         try:
-            print("Driver capabilities:", driver.capabilities, flush=True)
-        except Exception:
-            pass
-        return driver
-    except Exception as e:
-        print(f"❌ Failed to start Chromium/WebDriver: {e}", flush=True)
-        raise
+            print(f"Launching Chromium (headless={headless_variant}) with user-data-dir={user_data_dir} ...", flush=True)
+            driver = webdriver.Chrome(service=service, options=options)
+            driver.set_page_load_timeout(45)
+            # attach the user-data-dir so we can clean it up later
+            try:
+                driver._selenium_user_data_dir = user_data_dir
+            except Exception:
+                pass
+            print("Chromium launched successfully.", flush=True)
+            try:
+                print("Driver capabilities:", driver.capabilities, flush=True)
+            except Exception:
+                pass
+            return driver
+        except WebDriverException as e:
+            print(f"⚠️ Chrome startup failed with headless={headless_variant}: {e}", flush=True)
+            last_exc = e
+            # If the driver was partially created, attempt to quit and continue
+            try:
+                # Some drivers may exist as local variables in the exception; ensure cleanup
+                pass
+            except Exception:
+                pass
+            # Try next headless variant
+            continue
+
+    # if we get here, both attempts failed: remove temp dir then raise the last exception
+    try:
+        shutil.rmtree(user_data_dir)
+    except Exception:
+        pass
+    raise last_exc or RuntimeError("Could not start Chrome/WebDriver")
 
 
 def run_single_check() -> bool:
@@ -220,11 +275,22 @@ def run_single_check() -> bool:
         print(f"❌ Fatal error: {e}", flush=True)
         return False
     finally:
+        # Quit the driver and cleanup any temporary user-data-dir we created
         if driver:
             try:
-                driver.quit()
-            except Exception as e:
-                print(f"⚠️ Error closing driver: {e}", flush=True)
+                user_data_dir = getattr(driver, "_selenium_user_data_dir", None)
+                try:
+                    driver.quit()
+                except Exception as e:
+                    print(f"⚠️ Error closing driver: {e}", flush=True)
+                if user_data_dir:
+                    try:
+                        shutil.rmtree(user_data_dir)
+                        print(f"Removed temporary user-data-dir: {user_data_dir}", flush=True)
+                    except Exception as e:
+                        print(f"⚠️ Could not remove user-data-dir {user_data_dir}: {e}", flush=True)
+            except Exception:
+                pass
 
 
 def run_with_retry() -> bool:
@@ -260,6 +326,7 @@ def run_with_retry() -> bool:
 
 if __name__ == "__main__":
     now_madrid = datetime.now(ZoneInfo("Europe/Madrid"))
+    # FORCE_RUN should be "true" to force execution outside window
     force_run = os.environ.get("FORCE_RUN", "").lower() == "true"
 
     if not force_run and not within_active_window():
