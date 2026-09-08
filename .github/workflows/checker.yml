@@ -15,11 +15,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: browser-actions/setup-chrome@v1
-        with:
-          chrome-version: stable
-          install-chromedriver: true
-        id: setup-chrome
+      - name: Install Chrome dependencies
+            run: |
+           sudo apt-get update
+           sudo apt-get install -y chromium-browser chromium-chromedriver
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -31,6 +30,6 @@ jobs:
           DOC_NUMBER: ${{ secrets.DOC_NUMBER }}
           FULL_NAME: ${{ secrets.FULL_NAME }}
           NATIONALITY: ${{ secrets.NATIONALITY }}
-          CHROME_BIN: ${{ steps.setup-chrome.outputs.chrome-path }}
-          CHROMEDRIVER_PATH: ${{ steps.setup-chrome.outputs.chromedriver-path }}
+          CHROME_BIN: /usr/bin/chromium-browser
+          CHROMEDRIVER_PATH: /usr/bin/chromedriver
           FORCE_RUN: ${{ inputs.force_run }}
