@@ -7,7 +7,6 @@ from zoneinfo import ZoneInfo
 import requests
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import Select, WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
@@ -86,21 +85,27 @@ def build_driver():
         "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
     )
     # Use "normal" page load strategy for stability — waits for network idle.
-    # "eager" was causing race conditions and crashes.
     options.page_load_strategy = "normal"
     options.binary_location = os.environ.get("CHROME_BIN", "/usr/bin/chromium-browser")
 
     print("Launching Chromium...", flush=True)
-    driver_path_env = os.environ.get("CHROMEDRIVER_PATH", "")
-    if driver_path_env and driver_path_env != "chromedriver":
-        service = Service(executable_path=driver_path_env, service_args=["--verbose"])
-    else:
-        service = Service(service_args=["--verbose"])
-    
-    driver = webdriver.Chrome(service=service, options=options)
-    driver.set_page_load_timeout(45)
-    print("Chromium launched successfully.", flush=True)
-    return driver
+
+    try:
+        # Let Selenium Manager handle the driver binary when possible (selenium>=4.8)
+        # If CHROMEDRIVER_PATH is provided we still let Selenium pick it up via PATH,
+        # otherwise Selenium Manager will download a compatible driver automatically.
+        driver = webdriver.Chrome(options=options)
+        driver.set_page_load_timeout(45)
+        print("Chromium launched successfully.", flush=True)
+        # Print capabilities for debugging (shows browser version and binary used)
+        try:
+            print("Driver capabilities:", driver.capabilities, flush=True)
+        except Exception:
+            pass
+        return driver
+    except Exception as e:
+        print(f"❌ Failed to start Chromium/WebDriver: {e}", flush=True)
+        raise
 
 
 def run_single_check() -> bool:
@@ -115,10 +120,10 @@ def run_single_check() -> bool:
             driver.get(BASE_URL)
         except TimeoutException:
             print("Homepage load timed out — proceeding with whatever loaded so far.", flush=True)
-        
+
         # Wait for page and JavaScript to settle
         time.sleep(2)
-        
+
         sede_el = wait.until(EC.presence_of_element_located((By.ID, "sede")))
         Select(sede_el).select_by_value(OFICINA_VALUE)
 
@@ -190,6 +195,25 @@ def run_single_check() -> bool:
         return True
 
     except WebDriverException as e:
+        # Capture debugging artifacts to help diagnose CI/browser failures
+        try:
+            if driver:
+                screenshot_path = os.environ.get("ERROR_SCREENSHOT_PATH", "error.png")
+                page_source_path = os.environ.get("ERROR_PAGE_SOURCE", "page_source.html")
+                try:
+                    driver.save_screenshot(screenshot_path)
+                    print(f"Saved screenshot to {screenshot_path}", flush=True)
+                except Exception:
+                    pass
+                try:
+                    with open(page_source_path, "w", encoding="utf-8") as f:
+                        f.write(driver.page_source)
+                    print(f"Saved page source to {page_source_path}", flush=True)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
         print(f"❌ WebDriver error: {e}", flush=True)
         return False
     except Exception as e:
@@ -212,9 +236,18 @@ def run_with_retry() -> bool:
         
         try:
             result = run_single_check()
-            return result
+            if result:
+                return True
+            else:
+                print(f"❌ Attempt {attempt} returned failure (False).", flush=True)
+                if attempt < MAX_RETRIES:
+                    print(f"⏳ Waiting {RETRY_DELAY}s before retry...", flush=True)
+                    time.sleep(RETRY_DELAY)
+                else:
+                    print("❌ All retry attempts exhausted.", flush=True)
+                    return False
         except Exception as e:
-            print(f"❌ Attempt {attempt} failed: {e}", flush=True)
+            print(f"❌ Attempt {attempt} failed with exception: {e}", flush=True)
             if attempt < MAX_RETRIES:
                 print(f"⏳ Waiting {RETRY_DELAY}s before retry...", flush=True)
                 time.sleep(RETRY_DELAY)
@@ -239,8 +272,14 @@ if __name__ == "__main__":
         print(f"[{now_madrid.strftime('%Y-%m-%d %H:%M:%S')}] Within active window — running check")
 
     try:
-        run_with_retry()
+        result = run_with_retry()
     except Exception as e:
         print(f"❌ Fatal error after all retries: {e}", flush=True)
         sys.exit(1)
+
+    if not result:
+        print("❌ Check finished but reported failure (no availability / webdriver issue). Exiting with non-zero code.", flush=True)
+        sys.exit(1)
+
+    print("✅ Check finished and reported success.")
     sys.exit(0)
