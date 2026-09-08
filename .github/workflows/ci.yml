@@ -11,19 +11,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install system dependencies
+      - name: Install system dependencies (Chromium)
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
+          sudo apt-get install -y --install-recommends \
             chromium-browser \
             chromium-chromedriver \
             libnss3 \
             libatk1.0-0 \
-            libxss1 \
-            
+            libxss1 \ 
             fonts-liberation \
-            libx11-xcb1 \
-            libxcb1
 
       - name: Show browser + driver versions
         run: |
