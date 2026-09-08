@@ -90,7 +90,7 @@ def build_driver():
     else:
         service = Service(service_args=["--verbose"])
     driver = webdriver.Chrome(service=service, options=options)
-    driver.set_page_load_timeout(30)
+    driver.set_page_load_timeout(60)
     print("Chromium launched successfully.", flush=True)
     return driver
 
