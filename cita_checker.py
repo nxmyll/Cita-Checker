@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -10,7 +11,7 @@ from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import Select, WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException
+from selenium.common.exceptions import TimeoutException, WebDriverException
 
 # ============== CONFIG ==============
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -38,6 +39,8 @@ NO_CITAS_PHRASE = "no ofrece el servicio de Cita Previa Internet"
 
 ACTIVE_WINDOW_START_HOUR = 8
 ACTIVE_WINDOW_END_HOUR = 16
+MAX_RETRIES = 2
+RETRY_DELAY = 5  # seconds
 # =====================================
 
 
@@ -82,32 +85,29 @@ def build_driver():
         "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
     )
-    # "eager" returns control once the DOM is parsed, without waiting for every
-    # background script (e.g. anti-bot JS) to finish — avoids hanging forever
-    # on pages with long-running or intentionally-slow scripts.
-    options.page_load_strategy = "eager"
-    options.binary_location = os.environ.get("CHROME_BIN", "/usr/bin/chromium")
+    # Use "normal" page load strategy for stability — waits for network idle.
+    # "eager" was causing race conditions and crashes.
+    options.page_load_strategy = "normal"
+    options.binary_location = os.environ.get("CHROME_BIN", "/usr/bin/chromium-browser")
 
     print("Launching Chromium...", flush=True)
-    # nanasess/setup-chromedriver puts chromedriver on PATH — let Selenium
-    # find it there rather than requiring an explicit (and easy to get wrong)
-    # executable path. Only override if CHROMEDRIVER_PATH is explicitly set
-    # to something other than the bare word "chromedriver".
     driver_path_env = os.environ.get("CHROMEDRIVER_PATH", "")
     if driver_path_env and driver_path_env != "chromedriver":
         service = Service(executable_path=driver_path_env, service_args=["--verbose"])
     else:
         service = Service(service_args=["--verbose"])
+    
     driver = webdriver.Chrome(service=service, options=options)
-    driver.set_page_load_timeout(60)
+    driver.set_page_load_timeout(45)
     print("Chromium launched successfully.", flush=True)
     return driver
 
 
 def run_single_check() -> bool:
-    driver = build_driver()
+    driver = None
     try:
-        wait = WebDriverWait(driver, 25)
+        driver = build_driver()
+        wait = WebDriverWait(driver, 20)
 
         # Step 1: homepage -> select office + procedure
         print("Loading homepage...", flush=True)
@@ -115,6 +115,10 @@ def run_single_check() -> bool:
             driver.get(BASE_URL)
         except TimeoutException:
             print("Homepage load timed out — proceeding with whatever loaded so far.", flush=True)
+        
+        # Wait for page and JavaScript to settle
+        time.sleep(2)
+        
         sede_el = wait.until(EC.presence_of_element_located((By.ID, "sede")))
         Select(sede_el).select_by_value(OFICINA_VALUE)
 
@@ -148,8 +152,7 @@ def run_single_check() -> bool:
 
         # Step 4: result — either bounced back with "no citas" message,
         # a captcha, or (if slots exist) an actual booking/calendar page.
-        wait.until(lambda d: d.execute_script("return document.readyState") == "complete")
-        driver.implicitly_wait(5)
+        time.sleep(3)
         page_text = driver.page_source
 
         if NO_CITAS_PHRASE in page_text:
@@ -186,8 +189,40 @@ def run_single_check() -> bool:
         print("🚨 Unexpected page state (not the known no-citas message) — alert sent.")
         return True
 
+    except WebDriverException as e:
+        print(f"❌ WebDriver error: {e}", flush=True)
+        return False
+    except Exception as e:
+        print(f"❌ Fatal error: {e}", flush=True)
+        return False
     finally:
-        driver.quit()
+        if driver:
+            try:
+                driver.quit()
+            except Exception as e:
+                print(f"⚠️ Error closing driver: {e}", flush=True)
+
+
+def run_with_retry() -> bool:
+    """Run the check with retry logic for transient failures."""
+    for attempt in range(1, MAX_RETRIES + 1):
+        print(f"\n{'='*50}")
+        print(f"Attempt {attempt}/{MAX_RETRIES}")
+        print(f"{'='*50}\n", flush=True)
+        
+        try:
+            result = run_single_check()
+            return result
+        except Exception as e:
+            print(f"❌ Attempt {attempt} failed: {e}", flush=True)
+            if attempt < MAX_RETRIES:
+                print(f"⏳ Waiting {RETRY_DELAY}s before retry...", flush=True)
+                time.sleep(RETRY_DELAY)
+            else:
+                print("❌ All retry attempts exhausted.", flush=True)
+                raise
+    
+    return False
 
 
 if __name__ == "__main__":
@@ -204,8 +239,8 @@ if __name__ == "__main__":
         print(f"[{now_madrid.strftime('%Y-%m-%d %H:%M:%S')}] Within active window — running check")
 
     try:
-        run_single_check()
+        run_with_retry()
     except Exception as e:
-        print(f"❌ Fatal error: {e}", flush=True)
+        print(f"❌ Fatal error after all retries: {e}", flush=True)
         sys.exit(1)
     sys.exit(0)
