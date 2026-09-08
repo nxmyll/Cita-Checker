@@ -16,9 +16,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install Chrome dependencies
-      - run: |
-           sudo apt-get update
-           sudo apt-get install -y chromium-browser chromium-chromedriver
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y chromium-browser chromium-chromedriver
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
